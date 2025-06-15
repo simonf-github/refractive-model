@@ -1,61 +1,81 @@
-# display_ray_mapping.py
-# Visualizes ray_mapping.csv by drawing red pixels for starting rays
-# and blue pixels for final distorted hitpoints, scaled to 1280x800 display.
-
+import os
+import numpy as np
 import csv
 import matplotlib.pyplot as plt
-import numpy as np
+import cv2
+from scipy.interpolate import griddata
 
-INPUT_CSV = "ray_mapping.csv"
-DISPLAY_WIDTH = 1280
-DISPLAY_HEIGHT = 800
+# === CONFIG ===
+MAPPING_CSV = "ray_mapping.csv"
+TARGET_RES = (1280, 800)
+FLIP_INPUT_AXES = False     # Flip camera_x and camera_y
+FLIP_OUTPUT_AXES = False    # Flip distorted_x and distorted_y
 
-# Load data
-camera_pts = []
-distorted_pts = []
-
-with open(INPUT_CSV, newline='') as csvfile:
-    reader = csv.DictReader(csvfile)
+# === Load ray mapping ===
+cam_xs, cam_ys, dist_xs, dist_ys = [], [], [], []
+with open(MAPPING_CSV, newline='') as f:
+    reader = csv.DictReader(f)
     for row in reader:
-        cx = int(row['camera_x'])
-        cy = int(row['camera_y'])
-        camera_pts.append((cx, cy))
+        try:
+            cx_raw = float(row['camera_x'])
+            cy_raw = float(row['camera_y'])
+            dx_raw = float(row['distorted_x'])
+            dy_raw = float(row['distorted_y'])
 
-        if row['distorted_x'] != '' and row['distorted_y'] != '':
-            dx = float(row['distorted_x'])
-            dy = float(row['distorted_y'])
-            distorted_pts.append((cx, cy, dx, dy))
+            if FLIP_INPUT_AXES:
+                cx_raw, cy_raw = cy_raw, cx_raw
+            if FLIP_OUTPUT_AXES:
+                dx_raw, dy_raw = dy_raw, dx_raw
 
-# Normalize distorted x/y range to screen
-if distorted_pts:
-    xs = [pt[2] for pt in distorted_pts]
-    ys = [pt[3] for pt in distorted_pts]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
+            cx = cx_raw / 31 * (TARGET_RES[0] - 1)
+            cy = cy_raw / 19 * (TARGET_RES[1] - 1)
+            cam_xs.append(cx)
+            cam_ys.append(cy)
+            dist_xs.append(dx_raw)
+            dist_ys.append(dy_raw)
+        except:
+            continue
 
-    def scale_distorted(x, y):
-        sx = int((x - min_x) / (max_x - min_x) * (DISPLAY_WIDTH - 1))
-        sy = int((1 - (y - min_y) / (max_y - min_y)) * (DISPLAY_HEIGHT - 1))
-        return sx, sy
-else:
-    scale_distorted = lambda x, y: (0, 0)  # fallback
+# === Normalize distorted coordinates based on their actual extents ===
+dx_min, dx_max = min(dist_xs), max(dist_xs)
+dy_min, dy_max = min(dist_ys), max(dist_ys)
 
-# Create blank image
-img = np.zeros((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), dtype=np.uint8)
+# Scale distorted coordinates to canvas
+scaled_dist_xs = [(x - dx_min) / (dx_max - dx_min) * (TARGET_RES[0] - 1) for x in dist_xs]
+scaled_dist_ys = [(y - dy_min) / (dy_max - dy_min) * (TARGET_RES[1] - 1) for y in dist_ys]
 
-# Draw red camera frustum grid
-for cx, cy in camera_pts:
-    sx = int(cx / 31 * (DISPLAY_WIDTH - 1))  # scale 0–31 to 0–1279
-    sy = int((1 - cy / 19) * (DISPLAY_HEIGHT - 1))  # invert y
-    img[sy, sx] = [255, 0, 0]  # Red
+# === Interpolate distorted coords to full grid ===
+grid_x, grid_y = np.meshgrid(np.arange(TARGET_RES[0]), np.arange(TARGET_RES[1]))
+map_x = griddata((cam_xs, cam_ys), scaled_dist_xs, (grid_x, grid_y), method='linear', fill_value=-1)
+map_y = griddata((cam_xs, cam_ys), scaled_dist_ys, (grid_x, grid_y), method='linear', fill_value=-1)
 
-# Draw blue distorted hitpoints
-for cx, cy, dx, dy in distorted_pts:
-    sx, sy = scale_distorted(dx, dy)
-    img[sy, sx] = [0, 0, 255]  # Blue
+# === Function to generate diagonal stripe pattern ===
+def generate_pattern(angle_deg):
+    pattern = np.zeros((TARGET_RES[1], TARGET_RES[0], 3), dtype=np.uint8)
+    angle_rad = np.deg2rad(angle_deg)
+    cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+    for y in range(TARGET_RES[1]):
+        for x in range(TARGET_RES[0]):
+            pos = (x * cos_a + y * sin_a) % 100
+            color = plt.cm.hsv(pos / 100)[:3]
+            rgb = tuple(int(255 * c) for c in color)
+            pattern[y, x] = rgb
+    return pattern
 
-# Show image
-plt.imshow(img)
-plt.title("Red = Camera Grid, Blue = Distorted Hitpoints")
+# === Prompt user for angle ===
+try:
+    angle = float(input("Enter line angle in degrees (0 to 180): "))
+except ValueError:
+    print("Invalid input. Using angle = 0.")
+    angle = 0.0
+
+pattern = generate_pattern(angle)
+visual = np.zeros_like(pattern)
+valid = (map_x >= 0) & (map_y >= 0)
+visual[valid] = cv2.remap(pattern, map_x.astype(np.float32), map_y.astype(np.float32), interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)[valid]
+
+# === Display output ===
+plt.imshow(visual)
+plt.title(f"Distortion Map – Line Angle {angle:.0f}°")
 plt.axis('off')
 plt.show()
